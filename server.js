@@ -3,7 +3,7 @@ const session=require('express-session');
 const bcrypt=require('bcryptjs');
 const http=require('http');
 const path=require('path');
-const {WebSocketServer}=require('ws');
+const {WebSocketServer,WebSocket}=require('ws');
 const {v4:uuidv4}=require('uuid');
 
 const app=express();
@@ -14,6 +14,120 @@ const users=[{id:'admin-001',username:'admin',password:bcrypt.hashSync('admin123
 let multipliers=[];
 let rtpData={totalBet:0,totalPaid:0,retained:0,roundCount:0,rtpReal:97,rtpExpected:97,pressure:0};
 const wsClients=new Map();
+
+// ==========================================
+// CONEXÃO AUTOMÁTICA COM SMARTSOFT / JETX
+// ==========================================
+let smartsoftWs=null;
+let smartsoftConnected=false;
+let reconnectTimer=null;
+
+const SMARTSOFT_URL='wss://eu-server-w15.ssgportal.com/JetXNode728/signalr/connect?transport=webSockets&clientProtocol=1.5&group=JetX';
+
+function connectSmartSoft(){
+  console.log('[SmartSoft] Conectando...');
+  try{
+    smartsoftWs=new WebSocket(SMARTSOFT_URL,{
+      headers:{
+        'Origin':'https://vaidebet.com',
+        'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+      }
+    });
+
+    smartsoftWs.on('open',()=>{
+      console.log('[SmartSoft] Conectado!');
+      smartsoftConnected=true;
+      broadcast({type:'smartsoft_status',connected:true});
+      // Envia ping para manter conexão viva
+      setInterval(()=>{
+        if(smartsoftWs&&smartsoftWs.readyState===WebSocket.OPEN){
+          smartsoftWs.send(JSON.stringify({type:6})); // SignalR ping
+        }
+      },30000);
+    });
+
+    smartsoftWs.on('message',(data)=>{
+      try{
+        const raw=data.toString();
+        // Ignora mensagens vazias ou apenas de controle SignalR
+        if(!raw||raw==='{}'||raw==='[]')return;
+
+        const msg=JSON.parse(raw);
+
+        // SignalR handshake
+        if(msg.C||msg.S){
+          console.log('[SmartSoft] Handshake recebido');
+          return;
+        }
+
+        // Mensagens do tipo M (data messages)
+        if(msg.M&&Array.isArray(msg.M)){
+          msg.M.forEach(m=>{
+            if(m.M==='finish'||m.M==='roundResult'||m.M==='gameResult'){
+              const args=m.A||[];
+              let multiplier=null;
+
+              // Tenta extrair o multiplicador de diferentes formatos
+              if(args[0]&&args[0].result) multiplier=parseFloat(args[0].result);
+              else if(args[0]&&args[0].multiplier) multiplier=parseFloat(args[0].multiplier);
+              else if(args[0]&&args[0].crashPoint) multiplier=parseFloat(args[0].crashPoint);
+              else if(typeof args[0]==='number') multiplier=args[0];
+              else if(typeof args[1]==='number') multiplier=args[1];
+
+              if(multiplier&&!isNaN(multiplier)&&multiplier>=1){
+                console.log('[SmartSoft] Novo resultado: '+multiplier+'x');
+                processNewMultiplier(multiplier);
+              }
+            }
+          });
+        }
+
+        // Formato alternativo direto
+        if(msg.result||msg.multiplier||msg.crashPoint){
+          const m=parseFloat(msg.result||msg.multiplier||msg.crashPoint);
+          if(!isNaN(m)&&m>=1){
+            console.log('[SmartSoft] Resultado direto: '+m+'x');
+            processNewMultiplier(m);
+          }
+        }
+
+      }catch(e){
+        // Ignora erros de parse silenciosamente
+      }
+    });
+
+    smartsoftWs.on('error',(err)=>{
+      console.log('[SmartSoft] Erro: '+err.message);
+      smartsoftConnected=false;
+      broadcast({type:'smartsoft_status',connected:false});
+    });
+
+    smartsoftWs.on('close',()=>{
+      console.log('[SmartSoft] Desconectado. Reconectando em 5s...');
+      smartsoftConnected=false;
+      broadcast({type:'smartsoft_status',connected:false});
+      clearTimeout(reconnectTimer);
+      reconnectTimer=setTimeout(connectSmartSoft,5000);
+    });
+
+  }catch(e){
+    console.log('[SmartSoft] Falha ao conectar: '+e.message);
+    clearTimeout(reconnectTimer);
+    reconnectTimer=setTimeout(connectSmartSoft,5000);
+  }
+}
+
+function processNewMultiplier(m){
+  multipliers.unshift(m);
+  if(multipliers.length>1000)multipliers.pop();
+  rtpData.roundCount++;
+  broadcast({type:'new_round',multiplier:m,rtpData,multipliers:multipliers.slice(0,100),auto:true});
+}
+
+// Inicia conexão com SmartSoft ao subir o servidor
+connectSmartSoft();
+
+// ==========================================
 
 app.use(require('cors')({origin:true,credentials:true}));
 app.use(express.json());
@@ -40,23 +154,14 @@ app.post('/api/login',(req,res)=>{
 app.post('/api/logout',(req,res)=>{req.session.destroy();res.json({ok:true});});
 app.get('/api/me',auth,(req,res)=>res.json({id:req.user.id,username:req.user.username,plan:req.user.plan}));
 app.get('/api/data',auth,(req,res)=>res.json({multipliers,rtpData}));
+app.get('/api/status',(req,res)=>res.json({smartsoftConnected,roundCount:multipliers.length}));
 
 app.post('/api/push',(req,res)=>{
   const{token,multiplier,totalBet,totalPaid}=req.body;
   if(token!=='jetx2024')return res.status(403).json({error:'Token invalido'});
   const m=parseFloat(multiplier);
   if(isNaN(m)||m<1)return res.status(400).json({error:'Invalido'});
-  multipliers.unshift(m);
-  if(multipliers.length>1000)multipliers.pop();
-  const tb=totalBet||0,tp=totalPaid||0;
-  rtpData.totalBet+=tb;
-  rtpData.totalPaid+=tp;
-  rtpData.retained+=(tb-tp);
-  rtpData.roundCount++;
-  if(rtpData.totalBet>0)rtpData.rtpReal=(rtpData.totalPaid/rtpData.totalBet)*100;
-  const exp=rtpData.totalBet*(1-rtpData.rtpExpected/100);
-  rtpData.pressure=rtpData.retained-exp;
-  broadcast({type:'new_round',multiplier:m,rtpData,multipliers:multipliers.slice(0,100)});
+  processNewMultiplier(m);
   res.json({ok:true});
 });
 
@@ -106,7 +211,7 @@ wss.on('connection',(ws)=>{
           ws.uid=u.id;
           wsClients.set(u.id,ws);
           ws.send(JSON.stringify({type:'auth_ok',username:u.username}));
-          ws.send(JSON.stringify({type:'init',multipliers,rtpData}));
+          ws.send(JSON.stringify({type:'init',multipliers,rtpData,smartsoftConnected}));
         }
       } else if(d.type==='ping'){
         ws.send(JSON.stringify({type:'pong'}));
