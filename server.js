@@ -5,6 +5,7 @@ const http=require('http');
 const path=require('path');
 const {WebSocketServer,WebSocket}=require('ws');
 const {v4:uuidv4}=require('uuid');
+const fetch=require('node-fetch');
 
 const app=express();
 const server=http.createServer(app);
@@ -14,120 +15,6 @@ const users=[{id:'admin-001',username:'admin',password:bcrypt.hashSync('admin123
 let multipliers=[];
 let rtpData={totalBet:0,totalPaid:0,retained:0,roundCount:0,rtpReal:97,rtpExpected:97,pressure:0};
 const wsClients=new Map();
-
-// ==========================================
-// CONEXÃO AUTOMÁTICA COM SMARTSOFT / JETX
-// ==========================================
-let smartsoftWs=null;
-let smartsoftConnected=false;
-let reconnectTimer=null;
-
-const SMARTSOFT_URL='wss://eu-server-w15.ssgportal.com/JetXNode728/signalr/connect?transport=webSockets&clientProtocol=1.5&group=JetX';
-
-function connectSmartSoft(){
-  console.log('[SmartSoft] Conectando...');
-  try{
-    smartsoftWs=new WebSocket(SMARTSOFT_URL,{
-      headers:{
-        'Origin':'https://vaidebet.com',
-        'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-      }
-    });
-
-    smartsoftWs.on('open',()=>{
-      console.log('[SmartSoft] Conectado!');
-      smartsoftConnected=true;
-      broadcast({type:'smartsoft_status',connected:true});
-      // Envia ping para manter conexão viva
-      setInterval(()=>{
-        if(smartsoftWs&&smartsoftWs.readyState===WebSocket.OPEN){
-          smartsoftWs.send(JSON.stringify({type:6})); // SignalR ping
-        }
-      },30000);
-    });
-
-    smartsoftWs.on('message',(data)=>{
-      try{
-        const raw=data.toString();
-        // Ignora mensagens vazias ou apenas de controle SignalR
-        if(!raw||raw==='{}'||raw==='[]')return;
-
-        const msg=JSON.parse(raw);
-
-        // SignalR handshake
-        if(msg.C||msg.S){
-          console.log('[SmartSoft] Handshake recebido');
-          return;
-        }
-
-        // Mensagens do tipo M (data messages)
-        if(msg.M&&Array.isArray(msg.M)){
-          msg.M.forEach(m=>{
-            if(m.M==='finish'||m.M==='roundResult'||m.M==='gameResult'){
-              const args=m.A||[];
-              let multiplier=null;
-
-              // Tenta extrair o multiplicador de diferentes formatos
-              if(args[0]&&args[0].result) multiplier=parseFloat(args[0].result);
-              else if(args[0]&&args[0].multiplier) multiplier=parseFloat(args[0].multiplier);
-              else if(args[0]&&args[0].crashPoint) multiplier=parseFloat(args[0].crashPoint);
-              else if(typeof args[0]==='number') multiplier=args[0];
-              else if(typeof args[1]==='number') multiplier=args[1];
-
-              if(multiplier&&!isNaN(multiplier)&&multiplier>=1){
-                console.log('[SmartSoft] Novo resultado: '+multiplier+'x');
-                processNewMultiplier(multiplier);
-              }
-            }
-          });
-        }
-
-        // Formato alternativo direto
-        if(msg.result||msg.multiplier||msg.crashPoint){
-          const m=parseFloat(msg.result||msg.multiplier||msg.crashPoint);
-          if(!isNaN(m)&&m>=1){
-            console.log('[SmartSoft] Resultado direto: '+m+'x');
-            processNewMultiplier(m);
-          }
-        }
-
-      }catch(e){
-        // Ignora erros de parse silenciosamente
-      }
-    });
-
-    smartsoftWs.on('error',(err)=>{
-      console.log('[SmartSoft] Erro: '+err.message);
-      smartsoftConnected=false;
-      broadcast({type:'smartsoft_status',connected:false});
-    });
-
-    smartsoftWs.on('close',()=>{
-      console.log('[SmartSoft] Desconectado. Reconectando em 5s...');
-      smartsoftConnected=false;
-      broadcast({type:'smartsoft_status',connected:false});
-      clearTimeout(reconnectTimer);
-      reconnectTimer=setTimeout(connectSmartSoft,5000);
-    });
-
-  }catch(e){
-    console.log('[SmartSoft] Falha ao conectar: '+e.message);
-    clearTimeout(reconnectTimer);
-    reconnectTimer=setTimeout(connectSmartSoft,5000);
-  }
-}
-
-function processNewMultiplier(m){
-  multipliers.unshift(m);
-  if(multipliers.length>1000)multipliers.pop();
-  rtpData.roundCount++;
-  broadcast({type:'new_round',multiplier:m,rtpData,multipliers:multipliers.slice(0,100),auto:true});
-}
-
-// Inicia conexão com SmartSoft ao subir o servidor
-connectSmartSoft();
-
-// ==========================================
 
 app.use(require('cors')({origin:true,credentials:true}));
 app.use(express.json());
@@ -143,6 +30,145 @@ function auth(req,res,next){
   next();
 }
 
+// ==========================================
+// PROXY DA VAI DE BET
+// ==========================================
+app.get('/vaidebet',auth,(req,res)=>{
+  // Página que embute a Vai de Bet com script de captura injetado
+  const html=`<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>JetX - Vai de Bet</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box;}
+  body{background:#000;overflow:hidden;}
+  #hud{
+    position:fixed;top:10px;right:10px;z-index:99999;
+    background:rgba(0,0,0,0.9);border:2px solid #f0c040;
+    border-radius:10px;padding:8px 12px;font-family:Arial;
+    font-size:12px;color:white;min-width:150px;
+  }
+  #hud h3{color:#f0c040;font-size:13px;margin-bottom:4px;}
+  #frame-container{width:100vw;height:100vh;}
+  #jetframe{width:100%;height:100%;border:none;}
+  #overlay{
+    position:fixed;bottom:0;left:0;right:0;
+    background:rgba(0,0,0,0.95);border-top:2px solid #f0c040;
+    padding:8px;display:flex;gap:8px;align-items:center;
+    font-family:Arial;font-size:11px;color:white;
+    overflow-x:auto;white-space:nowrap;
+  }
+  .mult{
+    display:inline-block;padding:3px 8px;border-radius:5px;
+    background:#1a2035;font-weight:bold;font-size:12px;
+  }
+  .mult.high{color:#f0c040;}
+  .mult.mid{color:#4f4;}
+  .mult.low{color:#f44;}
+</style>
+</head>
+<body>
+
+<div id="hud">
+  <h3>⚡ JetX Sniper</h3>
+  <div id="status">🔴 Aguardando...</div>
+  <div>Rodadas: <b id="count" style="color:#f0c040">0</b></div>
+  <div>Último: <b id="last" style="color:#4f4">--</b></div>
+</div>
+
+<div id="overlay">
+  <span style="color:#f0c040;font-weight:bold">HISTÓRICO:</span>
+  <span id="history-strip">aguardando dados...</span>
+</div>
+
+<div id="frame-container">
+  <iframe id="jetframe" 
+    src="https://m.vaidebet.bet.br/ptb/games/casino/detail/normal/13477"
+    allow="autoplay; fullscreen"
+    sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals">
+  </iframe>
+</div>
+
+<script>
+const RAILWAY = 'https://jetx-sniper-production.up.railway.app';
+const TOKEN = 'jetx2024';
+let count = 0;
+let history = [];
+
+function updateHUD(connected, multiplier) {
+  if(connected !== undefined) {
+    document.getElementById('status').textContent = connected ? '🟢 CONECTADO' : '🔴 Aguardando...';
+  }
+  if(multiplier !== undefined) {
+    count++;
+    document.getElementById('count').textContent = count;
+    document.getElementById('last').textContent = multiplier + 'x';
+    history.unshift(multiplier);
+    if(history.length > 20) history.pop();
+    updateStrip();
+  }
+}
+
+function updateStrip() {
+  const strip = document.getElementById('history-strip');
+  strip.innerHTML = history.map(m => {
+    const cls = m >= 10 ? 'high' : m >= 2 ? 'mid' : 'low';
+    return '<span class="mult ' + cls + '">' + m + 'x</span>';
+  }).join(' ');
+}
+
+function sendToServer(multiplier) {
+  fetch(RAILWAY + '/api/push', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({token: TOKEN, multiplier: multiplier})
+  }).then(() => {
+    updateHUD(undefined, multiplier);
+  }).catch(e => console.log('Erro:', e));
+}
+
+// Intercepta mensagens do iframe
+window.addEventListener('message', function(e) {
+  try {
+    const d = typeof e.data === 'string' ? JSON.parse(e.data) : e.data;
+    if(d && d.jetx_result) {
+      updateHUD(true, d.jetx_result);
+      sendToServer(d.jetx_result);
+    }
+  } catch(ex) {}
+});
+
+// Tenta interceptar o WebSocket do iframe via postMessage
+const iframe = document.getElementById('jetframe');
+iframe.addEventListener('load', function() {
+  updateHUD(true);
+  console.log('iframe carregado');
+  
+  // Injeta script no iframe via postMessage (funciona se mesmo domínio)
+  try {
+    iframe.contentWindow.postMessage({type:'jetx_init'}, '*');
+  } catch(e) {}
+});
+
+// Monitora a URL do iframe para detectar mudanças
+setInterval(function() {
+  try {
+    const url = iframe.contentWindow.location.href;
+    console.log('iframe url:', url);
+  } catch(e) {}
+}, 5000);
+
+console.log('[JetX Sniper] Proxy ativo');
+</script>
+</body>
+</html>`;
+  res.send(html);
+});
+
+// ==========================================
+
 app.post('/api/login',(req,res)=>{
   const{username,password}=req.body;
   const u=users.find(u=>u.username===username);
@@ -154,14 +180,17 @@ app.post('/api/login',(req,res)=>{
 app.post('/api/logout',(req,res)=>{req.session.destroy();res.json({ok:true});});
 app.get('/api/me',auth,(req,res)=>res.json({id:req.user.id,username:req.user.username,plan:req.user.plan}));
 app.get('/api/data',auth,(req,res)=>res.json({multipliers,rtpData}));
-app.get('/api/status',(req,res)=>res.json({smartsoftConnected,roundCount:multipliers.length}));
+app.get('/api/status',(req,res)=>res.json({roundCount:multipliers.length}));
 
 app.post('/api/push',(req,res)=>{
-  const{token,multiplier,totalBet,totalPaid}=req.body;
+  const{token,multiplier}=req.body;
   if(token!=='jetx2024')return res.status(403).json({error:'Token invalido'});
   const m=parseFloat(multiplier);
   if(isNaN(m)||m<1)return res.status(400).json({error:'Invalido'});
-  processNewMultiplier(m);
+  multipliers.unshift(m);
+  if(multipliers.length>1000)multipliers.pop();
+  rtpData.roundCount++;
+  broadcast({type:'new_round',multiplier:m,rtpData,multipliers:multipliers.slice(0,100)});
   res.json({ok:true});
 });
 
@@ -211,9 +240,9 @@ wss.on('connection',(ws)=>{
           ws.uid=u.id;
           wsClients.set(u.id,ws);
           ws.send(JSON.stringify({type:'auth_ok',username:u.username}));
-          ws.send(JSON.stringify({type:'init',multipliers,rtpData,smartsoftConnected}));
+          ws.send(JSON.stringify({type:'init',multipliers,rtpData}));
         }
-      } else if(d.type==='ping'){
+      }else if(d.type==='ping'){
         ws.send(JSON.stringify({type:'pong'}));
       }
     }catch(e){}
